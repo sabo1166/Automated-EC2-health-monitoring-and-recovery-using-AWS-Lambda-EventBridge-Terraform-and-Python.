@@ -128,9 +128,16 @@ def launch_replacement():
         InstanceType=os.environ["INSTANCE_TYPE"],
         MinCount=1,
         MaxCount=1,
-        SubnetId=os.environ["SUBNET_ID"],
-        SecurityGroupIds=[os.environ["SECURITY_GROUP_ID"]],
-        AssociatePublicIpAddress=True,
+        # The public IP flag is only valid inside a network interface, which
+        # then owns the subnet and security group settings.
+        NetworkInterfaces=[
+            {
+                "DeviceIndex": 0,
+                "SubnetId": os.environ["SUBNET_ID"],
+                "Groups": [os.environ["SECURITY_GROUP_ID"]],
+                "AssociatePublicIpAddress": True,
+            }
+        ],
         UserData=os.environ["USER_DATA"],
         TagSpecifications=[
             {
