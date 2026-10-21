@@ -4,13 +4,15 @@
 
 **A serverless health checker that replaces a broken Nginx web server on AWS, built with Terraform and Python.**
 
-![Status](https://img.shields.io/badge/status-learning%20project-orange)
-![Tested](https://img.shields.io/badge/AWS%20runtime%20tests-not%20yet%20done-lightgrey)
-![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-7B42BC?logo=terraform&logoColor=white)
-![AWS](https://img.shields.io/badge/AWS-EC2%20%7C%20Lambda%20%7C%20DynamoDB-FF9900?logo=amazonaws&logoColor=white)
-![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![Nginx](https://img.shields.io/badge/Nginx-009639?logo=nginx&logoColor=white)
-![Amazon Linux](https://img.shields.io/badge/Amazon%20Linux-2023-232F3E?logo=amazonaws&logoColor=white)
+![Status](https://img.shields.io/badge/status-learning%20project-FF9900?style=flat-square)
+![Tested](https://img.shields.io/badge/AWS%20runtime%20tests-not%20yet%20done-687078?style=flat-square)
+![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-7B42BC?style=flat-square&logo=terraform&logoColor=white)
+![EC2](https://img.shields.io/badge/EC2-FF9900?style=flat-square&logo=amazonec2&logoColor=white)
+![Lambda](https://img.shields.io/badge/Lambda-7B3FE4?style=flat-square&logo=awslambda&logoColor=white)
+![EventBridge](https://img.shields.io/badge/EventBridge-1A73E8?style=flat-square&logo=amazonaws&logoColor=white)
+![DynamoDB](https://img.shields.io/badge/DynamoDB-2E9E5B?style=flat-square&logo=amazondynamodb&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![Nginx](https://img.shields.io/badge/Nginx-009639?style=flat-square&logo=nginx&logoColor=white)
 
 </div>
 
@@ -51,25 +53,45 @@ project:
 
 ## 🏗️ Architecture
 
+**Colour key:** 🟣 Lambda · 🔵 EventBridge / logs · 🟠 EC2 and AWS compute · 🟢 DynamoDB lock · ⚪ supporting network. Numbers show the order of a typical run. Solid arrows are implemented in the code; dotted arrows are indirect effects.
+
 ```mermaid
 flowchart LR
-    EB["⏰ EventBridge rule<br/>rate(N minutes)"] -->|invokes| L["λ Lambda<br/>handler.py"]
-    L <-->|"acquire / release lock"| DDB[("DynamoDB<br/>lock table")]
-    L -->|"DescribeInstances<br/>RunInstances<br/>TerminateInstances"| EC2API["EC2 API"]
-    L -->|"HTTP GET /"| WEB
-    L -.->|logs| CW["CloudWatch Logs"]
+    EB["<b>Amazon EventBridge</b><br/>schedule rule<br/>rate(N minutes)"]:::eventbridge
+    L["<b>AWS Lambda</b><br/>handler.py<br/>Python 3.12"]:::lambda
+    DDB[("<b>DynamoDB</b><br/>replacement lock<br/>(lease 360 s)")]:::lock
+    CW["<b>CloudWatch Logs</b><br/>Lambda logs"]:::eventbridge
+    API["<b>EC2 API</b><br/>Describe / Run /<br/>Terminate"]:::ec2
 
     subgraph VPC["VPC 10.0.0.0/16"]
+        direction TB
         subgraph SUB["Public subnet 10.0.1.0/24"]
-            WEB["🖥️ EC2 + Nginx<br/>Amazon Linux 2023"]
+            WEB["<b>EC2 + Nginx</b><br/>Amazon Linux 2023"]:::ec2
         end
-        SG["Security group<br/>TCP 80 from 0.0.0.0/0"]
+        SG["Security group<br/>TCP 80 from anywhere"]:::neutral
     end
 
-    IGW["Internet gateway"] --- SUB
-    USER(("🌐 Users")) -->|HTTP :80| WEB
-    EC2API -.->|"launches / terminates"| WEB
+    IGW["Internet gateway"]:::neutral
+    USER(("Users")):::neutral
+
+    EB -->|"1 · invoke"| L
+    L <-->|"2 · acquire / release lock"| DDB
+    L -->|"3 · read instance state<br/>launch / terminate"| API
+    L -->|"4 · HTTP GET / on port 80"| WEB
+    L -.->|"logs"| CW
+    API -.->|"manages"| WEB
+    USER -->|"HTTP :80"| IGW --> SG --> WEB
+
+    classDef eventbridge fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
+    classDef lambda fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
+    classDef ec2 fill:#FFF1DB,stroke:#FF9900,color:#7A4A00,stroke-width:2px
+    classDef lock fill:#E6F6EC,stroke:#2E9E5B,color:#14532D,stroke-width:2px
+    classDef neutral fill:#F2F3F4,stroke:#687078,color:#232F3E
+    style VPC fill:#FAFAFA,stroke:#232F3E,stroke-dasharray: 5 3
+    style SUB fill:#FFFFFF,stroke:#9AA1A9
 ```
+
+> Not shown because they don't exist yet: alarms or notifications, HTTPS, and a stable address. The health check runs from the Lambda over the public internet to the instance's public IP.
 
 | Component | Role in this project |
 |---|---|
@@ -97,22 +119,31 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A["Scheduled invocation"] --> B{"Lock acquired?"}
-    B -- No --> S1["Return: skipped"]
-    B -- Yes --> C["Find tagged instances<br/>(pending / running / stopping / stopped)"]
-    C --> D{"Newest instance state?"}
-    D -- "pending or stopping" --> W["Return: waiting"]
-    D -- "running + website OK" --> H["Return: healthy"]
-    D -- "running + website failing,<br/>stopped, or none found" --> R["Launch replacement"]
-    R --> V{"Replacement passes<br/>status + HTTP checks?"}
-    V -- Yes --> T["Terminate old instance<br/>Return: replaced"]
-    V -- No --> X["Terminate replacement<br/>Keep old instance<br/>Raise error"]
-    S1 --> Z["Release lock"]
+    A["Scheduled invocation<br/>(EventBridge)"]:::eventbridge --> B{"Lock acquired?"}:::lambda
+    B -- No --> S1["Return: skipped"]:::neutral
+    B -- Yes --> C["Find tagged instances<br/>pending / running / stopping / stopped"]:::lambda
+    C --> D{"Newest instance state?"}:::lambda
+    D -- "pending or stopping" --> W["Return: waiting"]:::neutral
+    D -- "running and<br/>HTTP check OK" --> H["Return: healthy"]:::healthy
+    D -- "running but HTTP failing,<br/>stopped, or none found" --> R["Unhealthy:<br/>launch replacement"]:::unhealthy
+    R --> V{"Replacement passes<br/>EC2 status check<br/>and HTTP check?"}:::lambda
+    V -- Yes --> T["Terminate old instance<br/>Return: replaced"]:::healthy
+    V -- No --> X["Terminate replacement<br/>keep old instance<br/>raise error"]:::unhealthy
+    S1 --> Z["Release lock"]:::lock
     W --> Z
     H --> Z
     T --> Z
     X --> Z
+
+    classDef eventbridge fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
+    classDef lambda fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
+    classDef healthy fill:#E6F6EC,stroke:#2E9E5B,color:#14532D,stroke-width:2px
+    classDef unhealthy fill:#FDE8E8,stroke:#D13212,color:#7F1D1D,stroke-width:2px
+    classDef lock fill:#FFF1DB,stroke:#FF9900,color:#7A4A00,stroke-width:2px
+    classDef neutral fill:#F2F3F4,stroke:#687078,color:#232F3E
 ```
+
+> This is what the code does. It has **not** been run on AWS yet, so treat the "healthy", "replaced" and error paths as designed behavior, not proven behavior.
 
 ### Step by step
 
