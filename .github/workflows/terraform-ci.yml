@@ -29,6 +29,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -55,6 +57,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
 
       - name: Terraform Init
         run: terraform init -backend=false
@@ -84,6 +88,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -93,11 +99,21 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Terraform Init
-        run: terraform init -backend=false
+        run: terraform init -input=false
 
       - name: Terraform Plan
-        run: terraform plan -lock=false
+        run: terraform plan -input=false -lock-timeout=60s -out=tfplan
 
+      # The Lambda zip is built during plan and read again at apply time.
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+          retention-days: 1
+          if-no-files-found: error
 
   apply:
     name: Terraform Apply
@@ -114,6 +130,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -123,8 +141,14 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Terraform Init
-        run: terraform init -backend=false
+        run: terraform init -input=false
 
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
+      # Applies exactly the plan produced by the plan job.
       - name: Terraform Apply
-        run: terraform apply -auto-approve -lock=false
-
+        run: terraform apply -input=false -lock-timeout=60s tfplan

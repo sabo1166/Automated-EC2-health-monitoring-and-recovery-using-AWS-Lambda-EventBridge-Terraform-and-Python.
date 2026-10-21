@@ -1,0 +1,17 @@
+# Terraform working data, state, and saved plans
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Built by the archive provider; regenerated on every plan
+terraform/lambda_function.zip
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Keep .terraform.lock.hcl committed (do not ignore it)
