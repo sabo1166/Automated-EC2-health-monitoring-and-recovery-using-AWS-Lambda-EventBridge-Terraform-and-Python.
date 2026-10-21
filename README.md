@@ -1,12 +1,12 @@
 <div align="center">
 
-# 🩺 Self-Healing EC2 Automation
+# Self-Healing EC2 Automation
 
-**A serverless health checker that replaces a broken Nginx web server on AWS, built with Terraform and Python.**
+**A serverless AWS recovery experiment: it monitors an Nginx web server and tries to replace an unhealthy EC2 instance using Lambda, EventBridge, DynamoDB and Terraform.**
 
 ![Status](https://img.shields.io/badge/status-learning%20project-FF9900?style=flat-square)
-![Tested](https://img.shields.io/badge/AWS%20runtime%20tests-not%20yet%20done-687078?style=flat-square)
-![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-7B42BC?style=flat-square&logo=terraform&logoColor=white)
+![Recovery](https://img.shields.io/badge/end--to--end%20recovery-not%20verified-687078?style=flat-square)
+![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.10-7B42BC?style=flat-square&logo=terraform&logoColor=white)
 ![EC2](https://img.shields.io/badge/EC2-FF9900?style=flat-square&logo=amazonec2&logoColor=white)
 ![Lambda](https://img.shields.io/badge/Lambda-7B3FE4?style=flat-square&logo=awslambda&logoColor=white)
 ![EventBridge](https://img.shields.io/badge/EventBridge-1A73E8?style=flat-square&logo=amazonaws&logoColor=white)
@@ -16,74 +16,61 @@
 
 </div>
 
-> ⚠️ **Project status:** This is a hands-on learning project. It is **not production-ready**, and the recovery flow has **not yet been tested on a real AWS account** (see [Testing and Verification](#-testing-and-verification)).
+> **Status:** a hands-on learning project, **not production-ready**. The code has local unit tests and one author-reported Lambda console test. The full recovery flow (replace, failure handling, concurrency, scheduled runs) has no recorded evidence yet. See [Testing and verification](#testing-and-verification).
 
----
+## Contents
 
-## 📌 The Problem
+[Overview](#overview) · [Key features](#key-engineering-features) · [Architecture](#architecture) · [Recovery workflow](#recovery-workflow) · [Repository](#repository-structure) · [Stack](#technology-stack) · [Configuration](#prerequisites-and-configuration) · [Deployment](#deployment-and-safe-validation) · [Testing](#testing-and-verification) · [Security](#security-design-and-limitations) · [Cost](#cost-and-cleanup) · [Limitations](#known-limitations-and-future-improvements) · [Learning](#learning-outcomes) · [Links](#links)
 
-A single web server can fail: Nginx stops, the instance hangs, or the instance is stopped or terminated. Without automation, someone has to notice and fix it by hand.
+## Overview
 
-This project checks the server on a schedule and, if it looks unhealthy, launches a new one. It only removes the old server **after** the new one is confirmed working.
+A single web server can fail: Nginx stops, the instance hangs, or someone stops it. This project checks one Nginx instance on a schedule. If the instance looks unhealthy, it launches a replacement and removes the old instance **only after the replacement passes its checks**.
 
-## 🧭 About the Project
+I built it to practise connecting several AWS services, describing them in Terraform, and thinking about what can go wrong: two checks running at once, a replacement that never becomes healthy, or state that Terraform doesn't know about.
 
-**Self-healing infrastructure** means the system detects a problem and fixes it without a person stepping in. Here, the "fix" is simple: replace the broken server with a fresh one built from the same recipe.
+## Key engineering features
 
-**Why I built it**
+- **Infrastructure as Code:** VPC, public subnet, internet gateway, security group, EC2, DynamoDB, IAM, Lambda and EventBridge are all defined in Terraform.
+- **Scheduled health checks:** an EventBridge rule (`rate(N minutes)`, default 5) invokes the Lambda.
+- **Safe replacement order:** launch the new instance, verify it, then terminate the old one. A failed replacement is terminated and the old instance is kept.
+- **Execution locking:** a DynamoDB conditional write with an owner token and a lease prevents overlapping replacement attempts.
+- **EC2 lifecycle handling:** distinct behaviour for running, stopped, pending and stopping instances.
+- **Remote Terraform state:** S3 backend with native lock file (`use_lockfile`).
+- **Local tests:** unit tests check the `run_instances` request against botocore's own parameter model.
 
-- Practise connecting several AWS services into one working flow.
-- Learn to describe the whole setup as code with Terraform.
-- Think about safety: what happens if two checks run at once, or a replacement fails?
-
-```yaml
-project:
-  name: Self-Healing EC2 Automation
-  type: Learning project (AWS + Terraform + Python)
-  goal: Replace an unhealthy Nginx EC2 instance automatically
-  trigger: EventBridge schedule (default every 5 minutes)
-  region: us-east-1 (default, configurable)
-  iac: Terraform
-  runtime: Python 3.12 on AWS Lambda
-  safety: DynamoDB lock + verify-before-terminate
-  status: Not production-ready, AWS runtime not yet verified
-```
-
----
-
-## 🏗️ Architecture
-
-**Colour key:** 🟣 Lambda · 🔵 EventBridge / logs · 🟠 EC2 and AWS compute · 🟢 DynamoDB lock · ⚪ supporting network. Numbers show the order of a typical run. Solid arrows are implemented in the code; dotted arrows are indirect effects.
+## Architecture
 
 ```mermaid
 flowchart LR
-    EB["<b>Amazon EventBridge</b><br/>schedule rule<br/>rate(N minutes)"]:::eventbridge
-    L["<b>AWS Lambda</b><br/>handler.py<br/>Python 3.12"]:::lambda
-    DDB[("<b>DynamoDB</b><br/>replacement lock<br/>(lease 360 s)")]:::lock
-    CW["<b>CloudWatch Logs</b><br/>Lambda logs"]:::eventbridge
-    API["<b>EC2 API</b><br/>Describe / Run /<br/>Terminate"]:::ec2
+    EB["<b>EventBridge rule</b><br/>rate(N minutes)"]:::eb
+    LAM["<b>Lambda: healer</b><br/>handler.lambda_handler<br/>Python 3.12"]:::lam
+    DDB[("<b>DynamoDB</b><br/>replacement lock")]:::lock
+    CWL["<b>CloudWatch Logs</b><br/>Lambda output"]:::eb
+    API["<b>EC2 API</b><br/>describe / run / terminate"]:::ec2
 
     subgraph VPC["VPC 10.0.0.0/16"]
-        direction TB
         subgraph SUB["Public subnet 10.0.1.0/24"]
-            WEB["<b>EC2 + Nginx</b><br/>Amazon Linux 2023"]:::ec2
+            OLD["<b>EC2 + Nginx</b><br/>current instance"]:::ec2
+            NEW["<b>EC2 + Nginx</b><br/>replacement<br/>(only when needed)"]:::ec2
         end
         SG["Security group<br/>TCP 80 from anywhere"]:::neutral
     end
-
     IGW["Internet gateway"]:::neutral
     USER(("Users")):::neutral
 
-    EB -->|"1 · invoke"| L
-    L <-->|"2 · acquire / release lock"| DDB
-    L -->|"3 · read instance state<br/>launch / terminate"| API
-    L -->|"4 · HTTP GET / on port 80"| WEB
-    L -.->|"logs"| CW
-    API -.->|"manages"| WEB
-    USER -->|"HTTP :80"| IGW --> SG --> WEB
+    EB -->|"invoke"| LAM
+    LAM <-->|"conditional put / delete"| DDB
+    LAM -->|"find tagged instances"| API
+    LAM -->|"HTTP GET / on port 80"| OLD
+    LAM -->|"launch replacement"| API
+    LAM -->|"HTTP GET / on port 80"| NEW
+    LAM -->|"terminate old, after verification"| API
+    LAM -.->|"logs, via managed policy"| CWL
+    API -.->|"creates / terminates"| NEW
+    USER -->|"HTTP :80"| IGW --> SG --> OLD
 
-    classDef eventbridge fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
-    classDef lambda fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
+    classDef eb fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
+    classDef lam fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
     classDef ec2 fill:#FFF1DB,stroke:#FF9900,color:#7A4A00,stroke-width:2px
     classDef lock fill:#E6F6EC,stroke:#2E9E5B,color:#14532D,stroke-width:2px
     classDef neutral fill:#F2F3F4,stroke:#687078,color:#232F3E
@@ -91,275 +78,250 @@ flowchart LR
     style SUB fill:#FFFFFF,stroke:#9AA1A9
 ```
 
-> Not shown because they don't exist yet: alarms or notifications, HTTPS, and a stable address. The health check runs from the Lambda over the public internet to the instance's public IP.
+Solid arrows are direct calls made by the code. Dotted arrows are indirect AWS behaviour. The Lambda runs outside the VPC and reaches the instance over its public IP.
 
-| Component | Role in this project |
+### Components and responsibilities
+
+| Component | Responsibility |
 |---|---|
-| **EventBridge rule** | Invokes the Lambda on a fixed schedule (`rate(N minutes)`). |
-| **Lambda (Python 3.12)** | Finds the current instance, checks the website, and replaces the instance if needed. Timeout 300 s, 256 MB. |
-| **EC2 + Nginx** | Public web server. Nginx is installed through `user_data` on Amazon Linux 2023 and serves a simple HTML page. |
-| **DynamoDB lock table** | One item (`LockId = "replacement"`) with an owner token and expiry time. A conditional write stops two checks from replacing at the same time. |
-| **IAM role** | Lets Lambda write logs, manage EC2 instances, and use the lock table. |
-| **CloudWatch Logs** | Receives Lambda logs through the AWS-managed `AWSLambdaBasicExecutionRole` policy. |
-| **VPC / subnet / IGW / route table / security group** | Basic public network for the web server. |
+| **EventBridge rule** | Invokes the Lambda on a schedule. A Lambda permission allows only this rule. |
+| **Lambda `healer`** | Python 3.12, 256 MB, 300 s timeout. Takes the lock, finds the instance, checks health, replaces if needed, releases the lock. |
+| **DynamoDB lock table** | On-demand table with hash key `LockId`. One item, `replacement`, holds an owner token and an expiry time. |
+| **EC2 + Nginx** | Amazon Linux 2023 (latest AMI at apply time), `t3.micro` by default. `user_data` installs Nginx and writes a small `index.html`. |
+| **VPC, subnet, IGW, route table, security group** | Public network (`10.0.0.0/16`, `10.0.1.0/24`, first available AZ). HTTP port 80 open to the internet. |
+| **IAM role** | Lets the Lambda write logs, manage EC2 instances and use the lock table. |
+| **CloudWatch Logs** | Receives the Lambda's output through `AWSLambdaBasicExecutionRole`. |
 
-**Implemented vs. not implemented**
-
-| Implemented in code | Not implemented |
-|---|---|
-| Scheduled invocation | CloudWatch alarms or notifications (SNS, email) |
-| HTTP health check from Lambda | HTTPS / TLS |
-| Launch-verify-then-terminate replacement | Stable address (Elastic IP, load balancer, DNS) |
-| DynamoDB lock with expiry | Terraform remote state |
-| Tagged-instance discovery | Automated tests |
-
----
-
-## ⚙️ How It Works
+## Recovery workflow
 
 ```mermaid
 flowchart TD
-    A["Scheduled invocation<br/>(EventBridge)"]:::eventbridge --> B{"Lock acquired?"}:::lambda
-    B -- No --> S1["Return: skipped"]:::neutral
-    B -- Yes --> C["Find tagged instances<br/>pending / running / stopping / stopped"]:::lambda
-    C --> D{"Newest instance state?"}:::lambda
-    D -- "pending or stopping" --> W["Return: waiting"]:::neutral
-    D -- "running and<br/>HTTP check OK" --> H["Return: healthy"]:::healthy
-    D -- "running but HTTP failing,<br/>stopped, or none found" --> R["Unhealthy:<br/>launch replacement"]:::unhealthy
-    R --> V{"Replacement passes<br/>EC2 status check<br/>and HTTP check?"}:::lambda
-    V -- Yes --> T["Terminate old instance<br/>Return: replaced"]:::healthy
-    V -- No --> X["Terminate replacement<br/>keep old instance<br/>raise error"]:::unhealthy
-    S1 --> Z["Release lock"]:::lock
+    A["Scheduled invocation"]:::eb --> B{"Lock acquired?"}:::lam
+    B -- "No" --> S["Return: skipped"]:::neutral
+    B -- "Yes" --> C["Find instances tagged<br/>Project + ManagedBy<br/>(pending, running, stopping, stopped)"]:::lam
+    C --> D{"Newest instance state"}:::lam
+    D -- "pending / stopping" --> W["Return: waiting"]:::neutral
+    D -- "running and HTTP check passes" --> H["Return: healthy"]:::ok
+    D -- "running but HTTP fails,<br/>stopped, or none found" --> R["Launch replacement<br/>in the same subnet and security group"]:::bad
+    R --> V["Wait: instance running,<br/>EC2 status checks OK,<br/>HTTP check passes"]:::lam
+    V -- "all pass" --> T["Terminate old instance<br/>Return: replaced"]:::ok
+    V -- "any step fails" --> X["Terminate replacement<br/>keep old instance<br/>raise error (logged by Lambda)"]:::bad
+    S --> Z["Release lock"]:::lock
     W --> Z
     H --> Z
     T --> Z
     X --> Z
 
-    classDef eventbridge fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
-    classDef lambda fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
-    classDef healthy fill:#E6F6EC,stroke:#2E9E5B,color:#14532D,stroke-width:2px
-    classDef unhealthy fill:#FDE8E8,stroke:#D13212,color:#7F1D1D,stroke-width:2px
+    classDef eb fill:#E8F1FB,stroke:#1A73E8,color:#0B3D91,stroke-width:2px
+    classDef lam fill:#F1E8FB,stroke:#7B3FE4,color:#3B1C80,stroke-width:2px
+    classDef ok fill:#E6F6EC,stroke:#2E9E5B,color:#14532D,stroke-width:2px
+    classDef bad fill:#FDE8E8,stroke:#D13212,color:#7F1D1D,stroke-width:2px
     classDef lock fill:#FFF1DB,stroke:#FF9900,color:#7A4A00,stroke-width:2px
     classDef neutral fill:#F2F3F4,stroke:#687078,color:#232F3E
 ```
 
-> This is what the code does. It has **not** been run on AWS yet, so treat the "healthy", "replaced" and error paths as designed behavior, not proven behavior.
+This diagram shows what the code does (`lambda/handler.py`). Most paths have not been run on AWS; see the verification table.
 
-### Step by step
-
-1. **Lock.** The Lambda tries to write a lock item to DynamoDB. It succeeds only if no lock exists or the old lock has expired (lease: 360 s). If it fails, the run is skipped.
-2. **Discover.** It looks for EC2 instances tagged `Project=<project_name>` and `ManagedBy=SelfHealing`, and takes the newest one.
+1. **Lock.** `PutItem` on `LockId = "replacement"` succeeds only if no item exists or its `ExpiresAt` has passed (lease 360 s). Otherwise the run returns `skipped`.
+2. **Discover.** Instances tagged `Project=<project_name>` and `ManagedBy=SelfHealing` in `pending`, `running`, `stopping` or `stopped` state. Only the **newest** by launch time is evaluated.
 3. **Decide.**
-   - **Healthy:** instance is `running` and `GET http://<public-ip>/` returns a status from 200 to 399 within 5 seconds. Nothing changes.
-   - **Waiting:** instance is `pending` or `stopping`. The run exits and tries again next time.
-   - **Unhealthy:** instance is `running` but the website fails, or it is `stopped`, or no instance was found. A replacement is started.
-4. **Replace.** A new instance is launched with the same AMI, instance type, subnet, security group, tags, and `user_data`.
-5. **Verify.** The Lambda waits for the instance to be `running`, then for EC2 status checks to pass, then retries the HTTP check up to 12 times (5 s apart).
-6. **Finish.**
-   - **Verified:** the old instance is terminated.
-   - **Failed:** the replacement is terminated, the old instance is **kept**, and the error is raised so it shows in the logs.
-7. **Unlock.** The lock is released in a `finally` block, only if this run still owns it.
+   - `pending` or `stopping`: return `waiting`.
+   - `running` and `GET http://<public-ip>/` returns 200 to 399 within 5 s: return `healthy`.
+   - `running` with a failing HTTP check or no public IP, `stopped`, or no instance: replace.
+4. **Replace.** `run_instances` with the same AMI, instance type, `user_data` and tags, using a single network interface that sets the subnet, security group and a public IP.
+5. **Verify.** Wait for `running` (up to about 120 s), then for EC2 status checks to pass (up to about 150 s), then try the HTTP check up to 12 times, 5 s apart.
+6. **Finish.** On success, terminate the old instance (if one exists) and return `replaced`. On any failure, terminate the replacement, keep the old instance and re-raise the error.
+7. **Unlock.** `finally` deletes the lock item only if the owner token still matches.
 
-### Known limitations
+A **stopped** instance is replaced, not restarted. The Lambda also terminates it after the replacement is verified.
 
-- **The public IP changes** after a replacement. There is no Elastic IP, load balancer, or DNS record, so the Terraform output `initial_website_url` becomes outdated.
-- **Terraform does not know about replacements.** A Lambda-created instance is outside Terraform state. `terraform destroy` will not remove it, so it must be deleted manually (find it by the `Project` / `ManagedBy` tags). A later `terraform apply` may also behave unexpectedly.
-- **Possible Lambda timeout.** The waits (running ≈ 2 min, status checks ≈ 2.5 min, HTTP retries ≈ 1 min) can add up to more than the 300 s timeout in a slow case. If that happens, the replacement could be left behind and the lock stays until it expires. I have not tested this.
-- **Only the newest instance is checked.** If several tagged instances exist, older ones are ignored.
-- **The health check is shallow.** It only tests one HTTP path from outside a VPC; it cannot detect partial failures or wrong content.
-- **A failed cleanup can mask the original error.** If terminating the failed replacement also errors, that error is raised instead.
-- **Boot-time false positives are possible.** A `running` instance that is still installing Nginx fails the HTTP check, so it could be replaced unnecessarily. The `pending` state is skipped, but there is no grace period after `running`.
-- **Single Availability Zone and single instance.** This is self-replacement, not high availability.
-
----
-
-## 🧰 Technology Stack
-
-| Category | Technology |
-|---|---|
-| **Cloud** | AWS (VPC, subnet, internet gateway, route table, security group, EC2) |
-| **Infrastructure as Code** | Terraform `>= 1.5.0`, AWS provider `~> 5.0`, Archive provider `~> 2.7` |
-| **Serverless** | AWS Lambda (Python 3.12), Amazon EventBridge (schedule rule) |
-| **Data** | Amazon DynamoDB (on-demand billing) for the lock |
-| **Monitoring** | Amazon CloudWatch Logs (Lambda logs only) |
-| **Operating system / web server** | Amazon Linux 2023 (x86_64), Nginx |
-| **Language** | Python 3.12 (`boto3`, `urllib`), HCL, Bash (`user_data`) |
-
----
-
-## 📂 Repository Structure
+## Repository structure
 
 ```text
 Self-Healing EC2 Automation/
-├── .gitignore            # currently empty
+├── .github/workflows/terraform-ci.yml   # manual workflow: init, validate, plan, apply
+├── .gitignore                           # Terraform state, plans, zip, caches
 ├── README.md
 ├── lambda/
-│   └── handler.py        # health check, lock, replace logic
-└── terraform/
-    ├── main.tf           # network, EC2, DynamoDB, IAM, Lambda, EventBridge
-    ├── variables.tf      # input variables
-    └── outputs.tf        # useful values after apply
+│   └── handler.py                       # health check, lock, replacement logic
+├── terraform/
+│   ├── main.tf                          # S3 backend, network, EC2, DynamoDB, IAM, Lambda, EventBridge
+│   ├── variables.tf
+│   └── outputs.tf
+└── tests/
+    └── test_handler.py                  # unit tests for the run_instances request
 ```
 
-Terraform packages `lambda/handler.py` into `terraform/lambda_function.zip` at plan/apply time.
+Terraform builds `terraform/lambda_function.zip` from `lambda/handler.py` (git-ignored). `.terraform.lock.hcl` is not committed yet; it will appear after the first `terraform init`.
 
----
+## Technology stack
 
-## 🔧 Configuration
+| Area | Technology |
+|---|---|
+| Cloud | AWS: EC2, VPC, Lambda, EventBridge, DynamoDB, IAM, CloudWatch Logs, S3 (state) |
+| Infrastructure as Code | Terraform ≥ 1.10, AWS provider `~> 5.0`, Archive provider `~> 2.7` |
+| Language | Python 3.12 (boto3, urllib), HCL, Bash (`user_data`) |
+| Operating system / web server | Amazon Linux 2023, Nginx |
+| CI | GitHub Actions (manual `workflow_dispatch`) |
 
-### Prerequisites
+## Prerequisites and configuration
 
-- An AWS account and credentials configured locally (for example `aws configure`)
-- [Terraform](https://developer.hashicorp.com/terraform/downloads) `>= 1.5.0`
-- Permission to create VPC, EC2, IAM, Lambda, DynamoDB, and EventBridge resources
+- AWS account and credentials; Terraform ≥ 1.10 (needed for S3 native locking); Python 3.
+- An existing S3 bucket for state. The backend in `terraform/main.tf` points to bucket `seconde-state-s3-2026-21`, key `self-healing-ec2/terraform.tfstate`, region `us-east-1`. Terraform does **not** create this bucket. I have not verified its settings; enabling versioning on it is recommended.
 
-### Variables
-
-| Variable | Default | Description |
+| Variable | Default | Meaning |
 |---|---|---|
-| `aws_region` | `us-east-1` | AWS region for all resources. |
-| `project_name` | `self-healing-ec2` | Prefix for resource names and the `Project` tag used to find instances. |
-| `instance_type` | `t3.micro` | EC2 instance type for the web server and replacements. |
-| `check_interval_minutes` | `5` | Minutes between checks. Must be 1 to 60. |
+| `aws_region` | `us-east-1` | Region for all resources (the backend region is set separately) |
+| `project_name` | `self-healing-ec2` | Name prefix and the `Project` tag used to find instances |
+| `instance_type` | `t3.micro` | Instance type for the server and replacements |
+| `check_interval_minutes` | `5` | Minutes between checks, validated as 1 to 60 |
 
-Other values are fixed in `main.tf`: VPC `10.0.0.0/16`, subnet `10.0.1.0/24` (first available AZ), health check path `/`, lock lease `360` seconds.
+Fixed in `main.tf`: VPC `10.0.0.0/16`, subnet `10.0.1.0/24`, health path `/`, lock lease 360 s.
+Outputs: `initial_website_url`, `initial_instance_id`, `lambda_function_name`, `health_check_schedule`, `dynamodb_lock_table`.
 
-### Outputs
+> **Known issue:** `check_interval_minutes = 1` builds `rate(1 minutes)`, but EventBridge expects `rate(1 minute)` for a value of 1. Use 2 to 60 until this is fixed. I have not tested the value 1 on AWS.
 
-`initial_website_url`, `initial_instance_id`, `lambda_function_name`, `health_check_schedule`, `dynamodb_lock_table`.
+## Deployment and safe validation
 
-### Safe local validation
-
-These commands do not create AWS resources:
+**Local checks (no AWS access, no resources)**
 
 ```bash
-cd terraform
-terraform fmt -check
-terraform init -backend=false
-terraform validate
-python -m py_compile ../lambda/handler.py
+terraform -chdir=terraform fmt -check
+terraform -chdir=terraform init -backend=false   # skips the S3 backend
+terraform -chdir=terraform validate
+python -m py_compile lambda/handler.py
+python -m unittest discover -s tests
 ```
 
-> `terraform plan` also makes no changes, but it needs valid AWS credentials to look up the AMI and availability zones. Review the plan before any apply.
+**Commands that contact AWS (read-only, but they touch state)**
 
----
+```bash
+terraform -chdir=terraform init     # reads/configures the S3 backend
+terraform -chdir=terraform plan     # reads state and AWS; changes nothing
+```
 
-## 🔐 Security
+**Commands that create, change or destroy billable resources**
 
-**What is in place**
+```bash
+terraform -chdir=terraform apply
+terraform -chdir=terraform destroy
+```
 
-- The Lambda has its own IAM role.
-- DynamoDB permissions are limited to `PutItem` and `DeleteItem` on the lock table only.
+Also in this group is the GitHub **Terraform Deploy** workflow (`workflow_dispatch`): `init` and `validate` use `-backend=false`; `plan` and `apply` use the S3 backend, and `apply` applies the saved plan from the `plan` job. **There is no approval step between `plan` and `apply`**, and the AWS keys come from repository secrets.
+
+Before the first run against an account that already has these resources, make sure the remote state matches reality. With empty state, `plan` will show every resource as new, and `apply` would fail on existing names or create duplicates. Import existing resources first, and review the plan before applying anything.
+
+## Testing and verification
+
+| Item | Status | Evidence |
+|---|---|---|
+| `terraform fmt -check` | Verified (local) | Run locally on the committed code |
+| `python -m py_compile`, unit tests (2) | Verified (local) | `tests/test_handler.py` checks the `run_instances` request shape against botocore's `RunInstances` model and the tag, AMI and user-data arguments |
+| `terraform validate`, `plan`, `apply` | Not verified here | No recorded output in the repository |
+| Lambda console test returns `healthy` | Reported by author | A console test returned `{"status":"healthy","instance_id":"i-…"}`. This is not stored in the repository. It shows one invocation took the lock, found a running instance and passed the HTTP check |
+| EventBridge invokes the Lambda on schedule | Not verified | Configured in Terraform; no scheduled-run evidence recorded |
+| Stopped or unhealthy instance is replaced | Not verified | Logic read and unit-tested only for the launch arguments |
+| Failed replacement keeps the old instance | Not verified | Logic read only |
+| Concurrent invocations are skipped | Not verified | Logic read only |
+| Expired lock takeover | Not verified | Logic read only |
+| Lambda timeout vs. total wait time | Not verified | See limitations |
+| CI runs unit tests | Not implemented | The workflow runs `py_compile` only |
+| CloudWatch alarms and notifications | Not implemented | |
+
+An earlier deployed version of the Lambda failed with `ParamValidationError` for `AssociatePublicIpAddress` placed at the top level of `run_instances`. The code now sets it inside `NetworkInterfaces`, which the unit tests check locally. The fix is **not** confirmed on AWS.
+
+**Tests still needed:** healthy run; stop Nginx and watch a replacement; stopped instance; failed replacement (for example broken `user_data`); two overlapping invocations; expired lock; slow replacement against the 300 s timeout; scheduled invocation; `destroy` plus manual cleanup.
+
+## Security design and limitations
+
+**Existing controls**
+
+- The Lambda has its own IAM role. DynamoDB access is limited to `PutItem` and `DeleteItem` on the lock table.
+- EventBridge may invoke the function only through this rule.
 - No SSH port is open and no key pair is attached.
-- The lock is released only by the invocation that owns it (owner token check).
-- A replacement that fails verification never causes the old instance to be deleted.
-- No secrets are stored in the code or Terraform files.
+- Lock release is conditional on the owner token.
+- The old instance is never terminated before the replacement passes its checks.
+- No secrets are stored in the code. State storage uses `encrypt = true`.
 
-**Known weaknesses (not yet fixed)**
+**Outstanding risks**
 
-| Issue | Detail |
+| Risk | Detail |
 |---|---|
-| **EC2 permissions are not least-privilege** | `RunInstances`, `TerminateInstances`, `CreateTags`, and describe actions use `Resource = "*"`. The code filters by tag, but IAM does not enforce it. Tag-based conditions are a planned improvement. |
-| **HTTP only** | Traffic on port 80 is unencrypted. No HTTPS or certificate. |
-| **Open to the world** | The security group allows port 80 from `0.0.0.0/0`. This is intended for the demo site but is still public exposure. |
-| **Open egress** | The instance may send traffic to any destination. |
-| **Instance hardening not configured** | IMDSv2 is not enforced and EBS encryption is not set explicitly. |
-| **Public-IP health check** | The Lambda checks the instance over the public internet instead of a private path. |
-| **Terraform state** | State is local and may contain sensitive data. `.gitignore` is currently empty, so **state files, `.terraform/`, and `lambda_function.zip` could be committed by mistake**. Fix this before pushing to GitHub. |
+| EC2 permissions are broad | `DescribeInstances`, `DescribeInstanceStatus`, `RunInstances`, `CreateTags` and `TerminateInstances` use `Resource = "*"` with no conditions. The tag filter exists only in the Python code; IAM does not enforce it. |
+| HTTP only, public | Port 80 is open to `0.0.0.0/0`; no HTTPS. |
+| Open egress | All outbound traffic is allowed. |
+| Instance hardening | IMDSv2 is not required and EBS encryption is not set in the configuration. |
+| Health check path | The Lambda is outside the VPC and checks the instance's public IP over the internet. |
+| Static CI credentials | The workflow uses long-lived access keys from GitHub secrets rather than OIDC. |
+| State and artifacts | State is in S3 (not in Git). `.gitignore` excludes state, plans and the generated zip; the saved plan is uploaded as a one-day workflow artifact. |
+| Bucket settings unverified | I have not confirmed versioning, encryption or public-access settings on the state bucket. |
 
----
+## Cost and cleanup
 
-## 💰 Cost Awareness
+Resources that can cost money: EC2 instances and their EBS volumes (a replacement briefly means two), public IPv4 addresses, Lambda invocations every interval, DynamoDB on-demand requests, CloudWatch Logs, and the S3 state bucket and its versions. I have not calculated costs; check current AWS pricing.
 
-This project can create billable AWS resources. I have not calculated costs, so check current AWS pricing before deploying.
+**What `terraform destroy` will not clean up**
 
-| Resource | Why it may cost money |
-|---|---|
-| EC2 instance(s) | Running instance time, and EBS storage. A replacement briefly means two instances at once. |
-| Public IPv4 addresses | AWS charges for public IPv4 addresses. |
-| Lambda | Invocations and run time (runs on every schedule tick). |
-| DynamoDB | On-demand reads and writes (very small here). |
-| CloudWatch Logs | Log ingestion and storage. No retention period is set, so logs are kept indefinitely. |
-| EventBridge | A scheduled rule; usually minimal. |
-| Data transfer | Outbound internet traffic. |
+- **Instances created by the Lambda** are outside Terraform state.
+- **The Lambda's log group** (`/aws/lambda/<project_name>-healer`) is created by AWS, is not defined in Terraform, and has no retention setting.
+- **The S3 state object and its versions.**
 
-Run `terraform destroy` when done, and also delete any instance the Lambda created (see limitations). Setting an AWS budget alert is a good habit.
+**Review before deleting anything by hand**
 
----
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=self-healing-ec2" "Name=tag:ManagedBy,Values=SelfHealing" \
+            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query "Reservations[].Instances[].[InstanceId,State.Name,LaunchTime,VpcId]" --output table
+```
 
-## ✅ Testing and Verification
+Check each ID against the Terraform state and the VPC before terminating it. Remove the scheduler (run `destroy` or disable the rule) first, otherwise the Lambda can launch a new instance after you delete one.
 
-| Check | Status |
-|---|---|
-| Source code and Terraform reviewed by reading | ✅ Done |
-| `terraform fmt` / `validate`, `py_compile` | ⏳ Commands documented, not run for this README |
-| Automated unit tests | ❌ None in the repository |
-| `terraform apply` on a real AWS account | ❌ Not verified |
-| Lambda runs on schedule | ❌ Not verified |
-| Healthy case returns `healthy` | ❌ Not verified |
-| Unhealthy case triggers a replacement | ❌ Not verified |
+## Known limitations and future improvements
 
-**No evidence of a real recovery exists yet, so this README does not claim that recovery works.**
+**Confirmed from the code**
 
-### Tests still required
+- **The public IP changes after a replacement.** There is no Elastic IP, load balancer or DNS, and the `initial_website_url` output goes stale.
+- **Terraform drift.** A replacement is not in Terraform state. A later `terraform apply` sees `aws_instance.web` as gone and plans a new instance with the same tags, which the Lambda then also discovers. `destroy` does not remove replacements.
+- **Possible Lambda timeout.** Worst-case waits (about 120 s + 150 s + roughly 115 s of HTTP retries) can exceed the 300 s timeout. A timeout could leave a replacement behind with the lock held until its lease expires.
+- **Only the newest instance is evaluated.** Older tagged instances, including duplicates, are never touched. Selection is by tag, not by VPC.
+- **No grace period** after `running`: an instance still installing Nginx fails the HTTP check and can be replaced unnecessarily.
+- **A failed cleanup can hide the original error:** the `terminate_instances` call for a failed replacement is not guarded.
+- **Little logging.** The code has no log statements; failures appear only through the uncaught exception and the returned status.
+- **Single instance, single AZ.** This is replacement, not high availability.
+- **`rate(1 minutes)`** is likely invalid (see configuration).
 
-- [ ] `terraform validate` and `terraform plan` succeed
-- [ ] Initial instance serves the Nginx page
-- [ ] Healthy instance → Lambda returns `healthy`, nothing is changed
-- [ ] Stop Nginx (or stop the instance) → replacement launched, verified, old instance terminated
-- [ ] Replacement that fails (for example broken `user_data`) → replacement terminated, old instance kept
-- [ ] Two overlapping invocations → one is `skipped`
-- [ ] Expired lock is taken over correctly
-- [ ] Slow replacement vs. the 300 s Lambda timeout
-- [ ] CloudWatch Logs show useful output
-- [ ] `terraform destroy` plus manual cleanup leaves no leftover resources
+**Possible next steps**
 
----
+- [ ] Record real AWS evidence for the tests listed above
+- [ ] Restrict EC2 permissions with tag conditions and narrower resources
+- [ ] Stable address (Elastic IP, load balancer or DNS) and HTTPS
+- [ ] Handle the timeout and clean up orphaned replacements; add a post-launch grace period
+- [ ] Add log statements, a log group with retention, and CloudWatch alarms
+- [ ] Require IMDSv2, encrypt EBS, restrict egress
+- [ ] Add an approval gate before `apply`, run unit tests in CI, use OIDC instead of static keys
+- [ ] Commit `.terraform.lock.hcl`
+- [ ] Fix the `rate(1 minute)` grammar for an interval of 1
 
-## 🎓 Learning Outcomes
+## Learning outcomes
 
-Working on this project gave me practice with:
+- Writing a multi-service AWS stack in Terraform, including IAM, EventBridge permissions and a remote S3 backend.
+- Using a DynamoDB conditional write as a lease-based lock.
+- Designing replacement order (verify first, delete last) and thinking through failure paths.
+- Using boto3 waiters and calling out a `ParamValidationError` bug through request-shape tests.
+- Spotting limits in my own design: IAM scope, Terraform drift, timeouts and cost leftovers.
 
-- Describing a network, compute, and serverless setup in **Terraform**
-- Connecting **EventBridge → Lambda → EC2 / DynamoDB** with IAM permissions
-- Writing **Python with boto3**, including waiters and error handling
-- Using a **DynamoDB conditional write** as a simple lock
-- Designing a **safe replacement order** (verify first, delete last)
-- Bootstrapping a server with **user_data**
-- Finding and writing down my own design gaps (IAM scope, state drift, timeouts)
+I'm still learning, and this repository shows my approach rather than production experience.
 
-I am still learning. This project shows the approach, not expert-level production skill.
-
----
-
-## 🗺️ Roadmap
-
-- [ ] Run and document a real AWS test, including the failure scenarios
-- [ ] Restrict IAM with tag conditions and narrower resources
-- [ ] Use an Elastic IP, load balancer, or DNS so the address survives replacement
-- [ ] Add HTTPS
-- [ ] Handle the Lambda timeout and clean up orphaned replacements
-- [ ] Add CloudWatch alarms and notifications (SNS)
-- [ ] Set log retention
-- [ ] Enforce IMDSv2, encrypt EBS, restrict egress
-- [ ] Add unit tests for `handler.py` (mocked AWS calls)
-- [ ] Add a remote Terraform backend and a populated `.gitignore`
-- [ ] Add a CI workflow for `fmt`, `validate`, and tests
-- [ ] Consider an Auto Scaling group as a managed alternative
-
----
-
-## 🤝 Connect
+## Links
 
 - GitHub: [github.com/sabo1166](https://github.com/sabo1166)
-- LinkedIn: *(placeholder: replace with your LinkedIn URL, or delete this line)*
-
-Feedback and suggestions are welcome.
+- LinkedIn: *(not added yet)*
 
 ---
 
 <div align="center">
 
-**Cloud engineering is learned by building, breaking, and fixing real systems. 🚀**
+**Cloud engineering is learned by building, breaking and fixing real systems.**
 
 </div>
